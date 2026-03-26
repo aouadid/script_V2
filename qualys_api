@@ -1,0 +1,241 @@
+
+
+import csv
+import datetime
+import urllib
+import requests
+import logging
+import time
+import xml.etree.ElementTree as ET
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+class QualysAPI:
+    def __init__(self, config, user, pwd, proxy_user, proxy_password):
+        self.session = requests.Session()
+        self.session.auth = (user, pwd)
+        self.session.headers.update({'X-Requested-With': config["http_header"]})
+        self.qualys_instance = config["qualys_instance"]
+        self.https_verify = False
+        self.session.trust_env = False
+
+        retries = Retry(total=5, backoff_factor=0.3, status_forcelist=[500, 502, 503, 504])
+        self.session.mount('http://', HTTPAdapter(max_retries=retries))
+        self.session.mount('https://', HTTPAdapter(max_retries=retries))
+
+        if config.get("proxy_use"):
+            encoded_proxy_user = urllib.parse.quote_plus(proxy_user)
+            encoded_proxy_password = urllib.parse.quote_plus(proxy_password)
+            proxy_url = f"{config['proxy_scheme']}://{encoded_proxy_user}:{encoded_proxy_password}@{config['proxy_server']}"
+            self.session.proxies = {
+                "http": proxy_url,
+                "https": proxy_url
+            }
+            logging.info(f"Configured proxy settings: {self.session.proxies}")
+
+    def webapp_create(self, name, url, scope, tags, scanner_type):
+        if not url.startswith("http://") and not url.startswith("https://"):
+            url = "https://%s" % url
+
+        try:
+            uri = "/qps/rest/3.0/create/was/webapp/"
+            data = f"""
+                <ServiceRequest>
+                    <data>
+                        <WebApp>
+                            <name><![CDATA[{name}]]></name>
+                            <url><![CDATA[{url}]]></url>
+                            <scope>ALL</scope>
+                            <scannerLocked>false</scannerLocked>
+                            <progressiveScanning>true</progressiveScanning>
+                            <malwareMonitoring>false</malwareMonitoring>
+                            <defaultProfile><id>1768537</id></defaultProfile>
+                            <defaultScanner>
+                                <type>{scanner_type}</type>
+                            </defaultScanner>
+                            <useRobots>ADD_PATHS</useRobots>
+                            <useSitemap>true</useSitemap>
+                            <comments><set><Comment><contents><![CDATA[Web App Created by Script]]></contents></Comment></set></comments>
+                            <tags><set>{"".join([f"<Tag><id>{tag}</id></Tag>" for tag in tags])}</set></tags>
+                        </WebApp>
+                    </data>
+                </ServiceRequest>
+            """
+            logging.debug(f"Web app creation request data: {data}")
+            response = self.session.post(f"{self.qualys_instance}{uri}", data=data, verify=False)
+            logging.debug(f"Response status code: {response.status_code}, Response text: {response.text}")
+            if response.status_code == 200:
+                logging.info("Web app created successfully")
+                return response.text
+            else:
+                logging.error(f"Failed to create web app: {response.text}")
+                return None
+        except Exception as e:
+            logging.error(f"Exception occurred during web app creation: {e}")
+            return None
+
+    def create_encrypted_report(self, webapp_id, report_name, password):
+        if not webapp_id:
+            logging.error("Missing WebApp ID")
+            return None
+        try:
+            uri = "/qps/rest/3.0/create/was/report"
+            cmddata = "<ServiceRequest><data><Report><name><![CDATA[%s]]></name><description><![CDATA[Qualys " \
+                      "report]]></description><format>PDF_ENCRYPTED</format><type>WAS_WEBAPP_REPORT</type><password" \
+                      "><![CDATA[%s]]></password><config><webAppReport><target><webapps><WebApp><id>%s</id></WebApp" \
+                      "></webapps></target></webAppReport></config><template><id>769692</id></template></Report" \
+                      "></data></ServiceRequest> "
+            data = cmddata % (report_name, password, webapp_id)
+            logging.debug(f"Create encrypted report request data: {data}")
+            status = ""
+            retries = 0
+            while status != "SUCCESS" and retries < 40:
+                r = self.session.post(f"{self.qualys_instance}{uri}", data=data, verify=False)
+                logging.debug(f"Response status code: {r.status_code}, Response text: {r.text}")
+                rdata = ET.fromstring(r.text)
+                status = rdata[0].text
+                time.sleep(5)
+                retries += 1
+
+            if status == "SUCCESS":
+                return rdata[2][0][0].text
+            else:
+                logging.error(f"Failed to create encrypted report: Time out exceeded for {report_name}")
+                return None
+        except Exception as e:
+            logging.error(f"Exception occurred during encrypted report creation: {e}")
+            return None
+
+    def download_report(self, report_id, save_to_file, directory):
+        if not report_id:
+            logging.error("Missing report ID")
+            return None
+        try:
+            uri = f"/qps/rest/3.0/status/was/report/{report_id}"
+            rs = None
+            retries = 0
+            while rs != "COMPLETE" and retries < 40:
+                r = self.session.get(f"{self.qualys_instance}{uri}", allow_redirects=True, verify=False)
+                logging.debug(f"Report status check response status code: {r.status_code}, Response text: {r.text}")
+                rdata = ET.fromstring(r.text)
+                rs = rdata[2][0][1].text
+                time.sleep(5)
+                retries += 1
+
+            if rs == "COMPLETE":
+                uri = f"/qps/rest/3.0/download/was/report/{report_id}"
+                r = self.session.get(f"{self.qualys_instance}{uri}", allow_redirects=True, verify=False)
+                if save_to_file:
+                    save_to_file = f"./{directory}/{save_to_file}.pdf"
+                    with open(save_to_file, "wb") as fh:
+                        fh.write(r.content)
+                    logging.info(f"Report {report_id} downloaded and saved to {save_to_file}.")
+                else:
+                    logging.error(f"Failed to download the report: {report_id}")
+        except Exception as e:
+            logging.error(f"Exception occurred during report download: {e}")
+            return None
+    def create_report_name(self, webapp_id):
+        appname = None
+        launchdate = None
+        if not webapp_id:
+            logging.error("Missing WebApp ID")
+            return None
+        try:
+            uri = f"/qps/rest/3.0/get/was/webapp/{webapp_id}"
+            r = self.session.get(f"{self.qualys_instance}{uri}", verify=False)
+            if r.text:
+                data = ET.fromstring(r.text)
+                appname = data.findall('data/WebApp/name')[0].text
+                lastscanID = data.findall('data/WebApp/lastScan/id')[0].text
+                logging.info(f"Appname: {appname}, LastScanID: {lastscanID}")
+
+                uri = f"/qps/rest/3.0/get/was/wasscan/{lastscanID}"
+                r = self.session.get(f"{self.qualys_instance}{uri}", verify=False)
+                if r.text:
+                    data = ET.fromstring(r.text)
+                    launchdate = data.findall('data/WasScan/launchedDate')[0].text
+                    datetime_obj = datetime.datetime.strptime(launchdate, "%Y-%m-%dT%H:%M:%SZ")
+                    date_str = str(datetime_obj.date()).replace('-', '')
+                return f"{appname}_{date_str}"
+        except Exception as e:
+            logging.error(f"Failed to create report name: {e}")
+            return None
+    def delete_report(self, report_id):
+        if not report_id:
+            logging.error("Missing Report ID")
+            return None
+        try:
+            uri = f"/qps/rest/3.0/delete/was/report/{report_id}"
+            r = self.session.post(f"{self.qualys_instance}{uri}", verify=False)
+            return r.status_code
+        except Exception as e:
+            logging.error(f"Exception occurred during report deletion: {e}")
+            return None
+    def check_health(self):
+        try:
+            response = self.session.get(f"{self.qualys_instance}/qps/rest/3.0", verify=False)
+            if response.status_code == 200:
+                logging.info("Qualys API is healthy")
+                return True
+            else:
+                logging.warning(f"Qualys API health check failed: {response.status_code}")
+                return False
+        except Exception as e:
+            logging.error(f"Qualys API health check exception: {e}")
+            return False
+
+    def get_webapp_id(self, xml_response):
+        try:
+            root = ET.fromstring(xml_response)
+            webapp = root.findall(".//WebApp")
+            if len(webapp) > 1:
+                logging.error("Too many webapps in the XML content")
+                return None
+            if len(webapp) < 1:
+                logging.error("No web app found")
+                return None
+            return webapp[0].find(".//id").text
+        except Exception as e:
+            logging.error(f"Exception occurred while getting webapp ID: {e}")
+            return None
+    def get_list_by_tag(self, tag_name):
+        try:
+            uri = "/qps/rest/3.0/search/was/webapp"
+            data = f"""
+                <ServiceRequest>
+                    <filters>
+                        <Criteria field="tags.name" operator="CONTAINS">{tag_name}</Criteria>
+                    </filters>
+                    <preferences>
+                        <limitResults>1000</limitResults>
+                    </preferences>
+                </ServiceRequest> 
+            """
+            # import pdb; pdb.set_trace()
+            response = self.session.post(f"{self.qualys_instance}{uri}", data=data, verify=False)
+            logging.debug(f"Search by tag request sent for TAG: {tag_name}")
+            if response.status_code == 200:
+                logging.info("Response 200 from Qualys API. Extracting Webapp IDs...")
+                ids = []
+                root = ET.fromstring(response.text)
+
+                for webapp in root.findall('.//WebApp'):
+                    entry_id = webapp.find('id').text
+                    ids.append(entry_id)
+
+                with open("tag.csv", mode='w', newline='') as csvfile:
+                    for entry_id in ids:
+                        csvfile.write(f"{entry_id},\n")
+
+                # Print the count of extracted IDs
+                print(f"Extracted {len(ids)} IDs.")
+                logging.info(f"Extracted {len(ids)} Webapp IDs...")
+            else:
+                logging.error(f"Failed to extract ids: {response.text}")
+                return None
+        except Exception as e:
+            logging.error(f"Exception occurred during web app creation: {e}")
+            return None
