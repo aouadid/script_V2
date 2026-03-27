@@ -1,0 +1,189 @@
+import requests
+import logging
+import os
+import traceback
+from datetime import datetime, timedelta
+
+
+class SharePointAPI:
+    def __init__(self, tenant_id, client_id, client_secret, site_url):
+        self.tenant_id = tenant_id
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self.site_url = site_url
+
+        self.base_url = "https://graph.microsoft.com/v1.0"
+        self.token = None
+        self.token_expiry = None
+        self.headers = None
+
+        logging.info("SharePointAPI initialized")
+
+    # 🔐 AUTHENTICATION (like Qualys session init)
+    def authenticate(self):
+        logging.debug("Starting SharePoint authentication...")
+
+        try:
+            url = f"https://login.microsoftonline.com/{self.tenant_id}/oauth2/v2.0/token"
+
+            payload = {
+                "client_id": self.client_id,
+                "client_secret": self.client_secret,
+                "scope": "https://graph.microsoft.com/.default",
+                "grant_type": "client_credentials"
+            }
+
+            response = requests.post(url, data=payload)
+
+            if response.status_code != 200:
+                logging.error(f"Auth failed: {response.text}")
+                raise Exception("Authentication failed")
+
+            data = response.json()
+
+            self.token = data["access_token"]
+            expires_in = data.get("expires_in", 3600)
+
+            self.token_expiry = datetime.now() + timedelta(seconds=expires_in)
+
+            self.headers = {
+                "Authorization": f"Bearer {self.token}",
+                "Content-Type": "application/json"
+            }
+
+            logging.info("✅ SharePoint authentication successful")
+
+        except Exception as e:
+            logging.error("❌ Authentication error")
+            logging.error(traceback.format_exc())
+            raise
+
+    # 🔄 SESSION HANDLING (like Qualys)
+    def ensure_authenticated(self):
+        if not self.token or datetime.now() >= self.token_expiry:
+            logging.debug("Token missing or expired → re-authenticating")
+            self.authenticate()
+        else:
+            logging.debug("Using existing SharePoint token")
+
+    # 📂 RESOLVE SITE ID
+    def get_site_id(self):
+        self.ensure_authenticated()
+
+        try:
+            logging.debug(f"Resolving site ID for {self.site_url}")
+
+            hostname = self.site_url.split("/")[2]
+            site_path = "/".join(self.site_url.split("/")[3:])
+
+            url = f"{self.base_url}/sites/{hostname}:/sites/{site_path}"
+
+            response = requests.get(url, headers=self.headers)
+
+            if response.status_code != 200:
+                logging.error(f"Failed to get site ID: {response.text}")
+                raise Exception("Site ID retrieval failed")
+
+            site_id = response.json()["id"]
+
+            logging.info(f"✅ Site ID resolved: {site_id}")
+            return site_id
+
+        except Exception:
+            logging.error(traceback.format_exc())
+            raise
+
+    # 📁 GET DRIVE ID
+    def get_drive_id(self, site_id):
+        self.ensure_authenticated()
+
+        try:
+            logging.debug("Retrieving drive ID")
+
+            url = f"{self.base_url}/sites/{site_id}/drive"
+
+            response = requests.get(url, headers=self.headers)
+
+            if response.status_code != 200:
+                logging.error(f"Failed to get drive ID: {response.text}")
+                raise Exception("Drive ID retrieval failed")
+
+            drive_id = response.json()["id"]
+
+            logging.info(f"✅ Drive ID: {drive_id}")
+            return drive_id
+
+        except Exception:
+            logging.error(traceback.format_exc())
+            raise
+
+    # 📂 ENSURE FOLDER STRUCTURE
+    def ensure_folder(self, drive_id, folder_path):
+        self.ensure_authenticated()
+
+        try:
+            logging.debug(f"Ensuring folder path: {folder_path}")
+
+            url = f"{self.base_url}/drives/{drive_id}/root:/{folder_path}"
+
+            response = requests.get(url, headers=self.headers)
+
+            if response.status_code == 200:
+                logging.debug("Folder already exists")
+                return
+
+            # Create folder
+            parent_path = os.path.dirname(folder_path)
+            folder_name = os.path.basename(folder_path)
+
+            create_url = f"{self.base_url}/drives/{drive_id}/root:/{parent_path}:/children"
+
+            payload = {
+                "name": folder_name,
+                "folder": {},
+                "@microsoft.graph.conflictBehavior": "rename"
+            }
+
+            create_resp = requests.post(create_url, headers=self.headers, json=payload)
+
+            if create_resp.status_code not in [200, 201]:
+                logging.error(f"Folder creation failed: {create_resp.text}")
+                raise Exception("Folder creation failed")
+
+            logging.info(f"📁 Folder created: {folder_path}")
+
+        except Exception:
+            logging.error(traceback.format_exc())
+            raise
+
+    # 📤 UPLOAD FILE
+    def upload_file(self, file_path, folder_path):
+        self.ensure_authenticated()
+
+        try:
+            file_name = os.path.basename(file_path)
+
+            logging.debug(f"Uploading file: {file_name}")
+            logging.debug(f"Target folder: {folder_path}")
+
+            site_id = self.get_site_id()
+            drive_id = self.get_drive_id(site_id)
+
+            self.ensure_folder(drive_id, folder_path)
+
+            upload_url = f"{self.base_url}/drives/{drive_id}/root:/{folder_path}/{file_name}:/content"
+
+            with open(file_path, "rb") as f:
+                response = requests.put(upload_url, headers={
+                    "Authorization": f"Bearer {self.token}"
+                }, data=f)
+
+            if response.status_code not in [200, 201]:
+                logging.error(f"Upload failed: {response.text}")
+                raise Exception("Upload failed")
+
+            logging.info(f"✅ File uploaded: {file_name} → {folder_path}")
+
+        except Exception:
+            logging.error(traceback.format_exc())
+            raise
