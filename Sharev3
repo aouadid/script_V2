@@ -2,9 +2,10 @@ import requests
 import logging
 import os
 import traceback
+import urllib3
 from datetime import datetime, timedelta
 
-
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 class SharePointAPI:
     def __init__(self, tenant_id, client_id, client_secret, site_url):
         self.tenant_id = tenant_id
@@ -33,7 +34,7 @@ class SharePointAPI:
                 "grant_type": "client_credentials"
             }
 
-            response = requests.post(url, data=payload)
+            response = requests.post(url, data=payload, verify=False)
 
             if response.status_code != 200:
                 logging.error(f"Auth failed: {response.text}")
