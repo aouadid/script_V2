@@ -1,0 +1,207 @@
+import traceback
+import logging
+import pykeepass
+import csv
+import json
+import os
+import shutil
+import re
+from urllib.parse import urlparse
+from tld import get_tld
+from classes.config import load_config
+from classes.qualys_api import QualysAPI
+from classes.sharepoint_api import SharePointAPI   # ✅ UPDATED IMPORT
+from classes.sharepoint_sync import SharepointSync
+from classes.keepass_manager import KeePassManager
+from password_generator import PasswordGenerator
+from getpass import getpass
+from pathlib import Path
+from datetime import datetime
+
+
+# ✅ LOGGING
+logging.basicConfig(
+    filename='script.log',
+    level=logging.DEBUG,
+    format='%(asctime)s [%(levelname)s] %(message)s'
+)
+
+try:
+    VAULT_KDBX = 'config/vault.kdbx'
+    CONFIG_YML = 'config/config.yml'
+    config = load_config(CONFIG_YML)
+
+    CONFIG_PATH = os.path.join(Path.home(), config["remote_config"]).replace("_", "\u2013")
+    WEBAPPS_INFO = os.path.join(CONFIG_PATH, 'webapps_info.json')
+
+    MASTER_KDBX = os.path.join(CONFIG_PATH, 'Apps.kdbx')
+    ROOT_KDBX = os.path.join(CONFIG_PATH, 'Scopes.kdbx')
+    BACKUP_PATH = os.path.join(CONFIG_PATH, 'Backup.kdbx')
+
+    # ✅ UPDATED SECRETS LIST
+    VAULT_SECRETS = [
+        'qualys_user', 'qualys_pwd',
+        'proxy_user', 'proxy_password',
+        'master_password', 'root_password',
+        'backup_password',
+        'sp_client_id', 'sp_client_secret', 'sp_tenant_id'
+    ]
+
+    WAS_REPORTS_PATH = os.path.join(Path.home(), config["sharepoint_site"]).replace("_", "\u2013")
+
+except Exception as e:
+    logging.error(f"Error initializing: {e}")
+
+
+# 🔐 VAULT
+def initialize_vault(keepass_manager):
+    logging.info("Initializing vault...")
+
+    vault_password = "e2fr1Ey!TWb9LPOFwC#e$Hx4"  # ⚠️ TEMP (keep as you had)
+
+    kp = pykeepass.PyKeePass(VAULT_KDBX, password=vault_password)
+
+    for secret in VAULT_SECRETS:
+        entry = kp.find_entries(title=secret, first=True)
+        if not entry or not entry.password:
+            secret_value = getpass(f"Enter value for {secret}: ")
+            if entry:
+                entry.password = secret_value
+            else:
+                kp.add_entry(kp.root_group, title=secret, username="user", password=secret_value)
+            kp.save()
+
+    secrets = {secret: kp.find_entries(title=secret, first=True).password for secret in VAULT_SECRETS}
+
+    logging.info("Vault loaded successfully")
+    logging.debug(f"Vault keys: {list(secrets.keys())}")  # ✅ DEBUG
+
+    return secrets
+
+
+# 🔐 PASSWORD
+def generate_password():
+    pwo = PasswordGenerator()
+    pwo.minlen = 20
+    pwo.maxlen = 25
+    pwo.excludeschars = "^.*`'~,&"
+    return pwo.generate()
+
+
+# 📂 LOAD WEBAPPS
+def load_webapps_info():
+    try:
+        with open(WEBAPPS_INFO, 'r') as jsonfile:
+            return json.load(jsonfile)
+    except Exception as e:
+        logging.error(f"Failed to load webapps info: {e}")
+        return {}
+
+
+# 📊 REPORT GENERATION
+def generate_reports(config, webapps_info, applist, keepass_manager, sharepoint_api):
+    logging.info(f"Starting report generation for {applist}")
+
+    reportdir = "./reports/"
+    os.makedirs(reportdir, exist_ok=True)
+
+    with open(applist, newline='') as csvfile:
+        reader = csv.reader(csvfile)
+
+        for row in reader:
+            if not row[0]:
+                continue
+
+            appID = row[0]
+            password = row[1] if row[1] else generate_password()
+
+            try:
+                reportName = qualys_api.create_report_name(appID)
+
+                logging.info(f"Generating report {reportName}")
+
+                reportID = qualys_api.create_encrypted_report(appID, reportName, password)
+
+                if reportID:
+                    qualys_api.download_report(reportID, reportName, reportdir)
+                    qualys_api.delete_report(reportID)
+
+                    file_path = f"{reportdir}/{reportName}.pdf"
+
+                    # ✅ UPLOAD TO SHAREPOINT
+                    try:
+                        folder_path = f"Reports/{appID}"
+                        sharepoint_api.upload_file(file_path, folder_path)
+
+                        logging.info(f"Uploaded {reportName} to SharePoint")
+
+                    except Exception as e:
+                        logging.error(f"SharePoint upload failed: {e}")
+
+            except Exception as e:
+                logging.error(f"Error processing {appID}: {e}")
+                continue
+
+
+# 🚀 MAIN
+def main():
+    global vault_secrets
+    global qualys_api
+    global sharepoint_api
+
+    keepass_manager = KeePassManager(MASTER_KDBX, ROOT_KDBX)
+
+    # 🔐 LOAD VAULT
+    vault_secrets = initialize_vault(keepass_manager)
+
+    print("Vault keys loaded:", vault_secrets.keys())  # ✅ DEBUG
+
+    webapps_info = load_webapps_info()
+
+    # 🔥 QUALYS INIT
+    qualys_api = QualysAPI(
+        config,
+        vault_secrets['qualys_user'],
+        vault_secrets['qualys_pwd'],
+        vault_secrets['proxy_user'],
+        vault_secrets['proxy_password']
+    )
+
+    logging.info("Qualys API initialized")
+
+    # 🔥 SHAREPOINT INIT (UPDATED)
+    sharepoint_api = SharePointAPI(
+        tenant_id=vault_secrets["sp_tenant_id"],
+        client_id=vault_secrets["sp_client_id"],
+        client_secret=vault_secrets["sp_client_secret"],
+        site_url=config["sharepoint_site_url"]   # ⚠️ must exist in config
+    )
+
+    logging.info("SharePoint API initialized")
+
+    # OPTIONAL TEST
+    try:
+        sharepoint_api.authenticate()
+    except Exception as e:
+        logging.error("Initial SharePoint auth failed")
+
+    # 🎛 MENU
+    while True:
+        print("\n1. Generate reports")
+        print("2. Exit")
+
+        choice = input("Choice: ")
+
+        if choice == "1":
+            applist = "applist.csv"
+            generate_reports(config, webapps_info, applist, keepass_manager, sharepoint_api)
+
+        elif choice == "2":
+            break
+
+        else:
+            print("Invalid choice")
+
+
+if __name__ == "__main__":
+    main()
