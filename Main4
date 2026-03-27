@@ -1,0 +1,165 @@
+import os
+import logging
+import yaml
+from qualys_api import QualysAPI
+from sharepoint_api import SharePointAPI
+from vault import get_vault_secrets  # assuming you already use this
+
+# =========================
+# LOGGING CONFIG
+# =========================
+logging.basicConfig(
+    filename="script.log",
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+
+# =========================
+# LOAD CONFIG
+# =========================
+def load_config():
+    with open("config/config.yml", "r") as f:
+        return yaml.safe_load(f)
+
+# =========================
+# GENERATE REPORTS
+# =========================
+def generate_reports(config):
+    try:
+        logging.info("Starting report generation...")
+
+        # =========================
+        # INIT VAULT
+        # =========================
+        vault_secrets = get_vault_secrets()
+        logging.info("Vault initialized successfully")
+
+        # =========================
+        # INIT QUALYS
+        # =========================
+        qualys = QualysAPI(
+            base_url=config["qualys_instance"],
+            username=vault_secrets["qualys_username"],
+            password=vault_secrets["qualys_password"]
+        )
+
+        qualys.login()
+        logging.info("Logged into Qualys")
+
+        # =========================
+        # INIT SHAREPOINT
+        # =========================
+        sharepoint = SharePointAPI(
+            tenant_id=vault_secrets["tenant_id"],
+            client_id=vault_secrets["client_id"],
+            client_secret=vault_secrets["client_secret"],
+            site_url=config["sharepoint_site"]
+        )
+
+        sharepoint.authenticate()
+        logging.info("Authenticated to SharePoint")
+
+        # =========================
+        # INPUT FILE
+        # =========================
+        input_file = "inputs/app_list.csv"
+
+        if not os.path.exists(input_file):
+            logging.error("Input file not found")
+            return
+
+        # =========================
+        # PROCESS APPS
+        # =========================
+        with open(input_file, "r") as f:
+            app_ids = [line.strip() for line in f.readlines() if line.strip()]
+
+        for app_id in app_ids:
+            try:
+                logging.info(f"Processing App ID: {app_id}")
+
+                # =========================
+                # GENERATE REPORT
+                # =========================
+                file_path = qualys.generate_report(app_id)
+
+                if not file_path:
+                    logging.error(f"Failed to generate report for {app_id}")
+                    continue
+
+                logging.info(f"Report generated: {file_path}")
+
+                # =========================
+                # BUILD SHAREPOINT PATH
+                # =========================
+                folder_path = f"DAST/WAS Reports/{app_id}"
+
+                # =========================
+                # UPLOAD TO SHAREPOINT
+                # =========================
+                sharepoint.upload_file(file_path, folder_path)
+
+                logging.info(f"Uploaded report for {app_id} to SharePoint")
+
+            except Exception as e:
+                logging.error(f"Error processing {app_id}: {str(e)}")
+
+    except Exception as e:
+        logging.error(f"Error in generate_reports: {str(e)}")
+
+
+# =========================
+# ONBOARD (KEEP YOUR LOGIC)
+# =========================
+def onboard():
+    logging.info("Onboard function triggered")
+    print("Onboard logic here (unchanged)")
+    # 👉 keep your original onboard code here
+
+
+# =========================
+# GENERATE WEBAPP NAME
+# =========================
+def generate_webapp_name():
+    logging.info("Generate Webapp Name triggered")
+    print("Generate Webapp name logic here")
+    # 👉 keep your original logic here
+
+
+# =========================
+# MAIN MENU
+# =========================
+def main():
+    config = load_config()
+
+    while True:
+        print("\nChoose an option:")
+        print("1. Generate reports")
+        print("2. Onboard")
+        print("3. Generate Webapp name from URL")
+        print("4. Exit")
+
+        choice = input("Enter your choice: ")
+
+        if choice == "1":
+            generate_reports(config)
+
+        elif choice == "2":
+            onboard()
+
+        elif choice == "3":
+            generate_webapp_name()
+
+        elif choice == "4":
+            print("Exiting...")
+            break
+
+        else:
+            print("Invalid choice")
+
+
+# =========================
+# ENTRY POINT
+# =========================
+if __name__ == "__main__":
+    main()
